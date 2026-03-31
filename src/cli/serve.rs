@@ -9,6 +9,7 @@ use hypura::profiler;
 use hypura::scheduler::placement::compute_placement_with_context;
 use hypura::server::ollama_types::GgufInfo;
 use hypura::server::routes::{self, AppState};
+use hypura::server::template::ChatTemplateEngine;
 use hypura::telemetry::metrics::TelemetryEmitter;
 
 pub fn run(model_path: &str, host: &str, port: u16, context: u32) -> anyhow::Result<()> {
@@ -77,10 +78,26 @@ async fn run_async(model_path: &str, host: &str, port: u16, context: u32) -> any
     let load_duration_ns = load_start.elapsed().as_nanos() as u64;
     let model_name = loaded.model_name.clone();
 
+    // Extract chat template and special tokens from model for Jinja2 rendering
+    let chat_template_str = loaded.model.chat_template();
+    let bos = loaded.model.bos_token();
+    let eos = loaded.model.eos_token();
+    let template_engine = ChatTemplateEngine::with_tokens(
+        chat_template_str.as_deref(),
+        &bos,
+        &eos,
+    );
+    if chat_template_str.is_some() {
+        println!("  Chat template: from model metadata");
+    } else {
+        println!("  Chat template: ChatML fallback");
+    }
+
     let telemetry = Arc::new(TelemetryEmitter::new(256));
 
     let state = Arc::new(AppState {
         loaded_model: Arc::new(std::sync::Mutex::new(loaded)),
+        template_engine,
         model_name: model_name.clone(),
         gguf_info,
         load_duration_ns,

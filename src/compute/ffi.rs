@@ -127,6 +127,18 @@ impl LlamaModel {
         }
     }
 
+    /// Get the BOS token text, if available.
+    pub fn bos_token(&self) -> String {
+        let id = unsafe { hypura_sys::llama_vocab_bos(self.vocab) };
+        if id < 0 { String::new() } else { self.token_to_piece(id) }
+    }
+
+    /// Get the EOS token text, if available.
+    pub fn eos_token(&self) -> String {
+        let id = unsafe { hypura_sys::llama_vocab_eos(self.vocab) };
+        if id < 0 { String::new() } else { self.token_to_piece(id) }
+    }
+
     /// Check if a token signals end of generation.
     pub fn is_eog(&self, token: i32) -> bool {
         unsafe { hypura_sys::llama_vocab_is_eog(self.vocab, token) }

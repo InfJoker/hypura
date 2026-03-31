@@ -26,12 +26,7 @@ pub fn ndjson_generate_stream(
                 response: token.text,
                 done: false,
                 done_reason: None,
-                total_duration: None,
-                load_duration: None,
-                prompt_eval_count: None,
-                prompt_eval_duration: None,
-                eval_count: None,
-                eval_duration: None,
+                timing: TimingStats::default(),
             };
             let mut line = serde_json::to_string(&chunk).unwrap_or_default();
             line.push('\n');
@@ -49,20 +44,7 @@ pub fn ndjson_generate_stream(
             response: String::new(),
             done: true,
             done_reason: Some("stop".into()),
-            total_duration: Some(total_ns),
-            load_duration: Some(load_duration_ns),
-            prompt_eval_count: result.as_ref().map(|r| r.prompt_tokens),
-            prompt_eval_duration: result
-                .as_ref()
-                .map(|r| (r.prompt_eval_ms * 1_000_000.0) as u64),
-            eval_count: result.as_ref().map(|r| r.tokens_generated),
-            eval_duration: result.as_ref().map(|r| {
-                if r.tok_per_sec_avg > 0.0 {
-                    (r.tokens_generated as f64 / r.tok_per_sec_avg * 1e9) as u64
-                } else {
-                    0
-                }
-            }),
+            timing: TimingStats::from_result(&result, total_ns, load_duration_ns),
         };
         let mut line = serde_json::to_string(&final_chunk).unwrap_or_default();
         line.push('\n');
@@ -73,32 +55,35 @@ pub fn ndjson_generate_stream(
 }
 
 /// Convert a token channel into an NDJSON streaming body for `/api/chat`.
+///
+/// Tool call parsing happens in the final chunk after all tokens are collected,
+/// matching Ollama's streaming behavior.
 pub fn ndjson_chat_stream(
     model_name: String,
     mut token_rx: mpsc::UnboundedReceiver<GeneratedToken>,
     result_rx: oneshot::Receiver<GenerationResult>,
     request_start: Instant,
     load_duration_ns: u64,
+    tools: Vec<crate::server::ollama_types::Tool>,
 ) -> Body {
     let (tx, rx) = mpsc::channel::<Result<String, std::io::Error>>(64);
 
     tokio::spawn(async move {
+        let mut full_response = String::new();
+
         while let Some(token) = token_rx.recv().await {
+            full_response.push_str(&token.text);
             let chunk = ChatResponseChunk {
                 model: model_name.clone(),
                 created_at: now_rfc3339(),
                 message: ChatMessage {
                     role: "assistant".into(),
-                    content: token.text,
+                    content: Some(token.text),
+                    tool_calls: None,
                 },
                 done: false,
                 done_reason: None,
-                total_duration: None,
-                load_duration: None,
-                prompt_eval_count: None,
-                prompt_eval_duration: None,
-                eval_count: None,
-                eval_duration: None,
+                timing: TimingStats::default(),
             };
             let mut line = serde_json::to_string(&chunk).unwrap_or_default();
             line.push('\n');
@@ -109,29 +94,32 @@ pub fn ndjson_chat_stream(
 
         let total_ns = request_start.elapsed().as_nanos() as u64;
         let result = result_rx.await.ok();
+
+        // Parse tool calls in the final chunk if tools were provided
+        let (content, tool_calls, done_reason) = if !tools.is_empty() {
+            use crate::server::tool_parse::{parse_tool_calls, ToolParseResult};
+            match parse_tool_calls(&full_response, &tools) {
+                ToolParseResult::ToolCalls { content, calls } => {
+                    let c = if content.is_empty() { None } else { Some(content) };
+                    (c, Some(calls), "tool_calls")
+                }
+                ToolParseResult::Text(t) => (Some(t), None, "stop"),
+            }
+        } else {
+            (Some(String::new()), None, "stop")
+        };
+
         let final_chunk = ChatResponseChunk {
             model: model_name,
             created_at: now_rfc3339(),
             message: ChatMessage {
                 role: "assistant".into(),
-                content: String::new(),
+                content,
+                tool_calls,
             },
             done: true,
-            done_reason: Some("stop".into()),
-            total_duration: Some(total_ns),
-            load_duration: Some(load_duration_ns),
-            prompt_eval_count: result.as_ref().map(|r| r.prompt_tokens),
-            prompt_eval_duration: result
-                .as_ref()
-                .map(|r| (r.prompt_eval_ms * 1_000_000.0) as u64),
-            eval_count: result.as_ref().map(|r| r.tokens_generated),
-            eval_duration: result.as_ref().map(|r| {
-                if r.tok_per_sec_avg > 0.0 {
-                    (r.tokens_generated as f64 / r.tok_per_sec_avg * 1e9) as u64
-                } else {
-                    0
-                }
-            }),
+            done_reason: Some(done_reason.into()),
+            timing: TimingStats::from_result(&result, total_ns, load_duration_ns),
         };
         let mut line = serde_json::to_string(&final_chunk).unwrap_or_default();
         line.push('\n');

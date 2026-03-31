@@ -7,6 +7,7 @@ use hypura::model::gguf::GgufFile;
 use hypura::profiler;
 use hypura::scheduler::placement::{compute_placement_with_context, summarize_placement};
 use hypura::scheduler::types::{PlacementSummary, StorageTier};
+use hypura::server::template::ChatTemplateEngine;
 use hypura::telemetry::metrics::TelemetryEmitter;
 
 use super::fmt_util::format_bytes;
@@ -66,16 +67,19 @@ async fn run_async(
     };
     config.sampling.max_tokens = max_tokens;
 
+    // Build chat template engine from GGUF metadata
+    let template_engine = ChatTemplateEngine::new(gguf.get_string("tokenizer.chat_template"));
+
     // Clone what we need for the blocking thread
     let plan = Arc::new(plan);
     let gguf = Arc::new(gguf);
 
     if interactive {
-        run_interactive(path, &config, n_gpu_layers, &plan, &gguf, telemetry).await
+        run_interactive(path, &config, n_gpu_layers, &plan, &gguf, telemetry, &template_engine).await
     } else if let Some(prompt_text) = prompt {
         run_single_prompt(path, prompt_text, &config, n_gpu_layers, &plan, &gguf, telemetry).await
     } else {
-        run_interactive(path, &config, n_gpu_layers, &plan, &gguf, telemetry).await
+        run_interactive(path, &config, n_gpu_layers, &plan, &gguf, telemetry, &template_engine).await
     }
 }
 
@@ -133,6 +137,7 @@ async fn run_interactive(
     plan: &Arc<hypura::scheduler::types::PlacementPlan>,
     gguf: &Arc<GgufFile>,
     telemetry: Arc<TelemetryEmitter>,
+    template_engine: &ChatTemplateEngine,
 ) -> anyhow::Result<()> {
     println!("Hypura Interactive Mode");
     println!("Type your message, then press Enter. Type /quit or Ctrl-D to exit.");
@@ -158,7 +163,7 @@ async fn run_interactive(
         }
 
         history.push(("user".into(), input.to_string()));
-        let full_prompt = format_chat_prompt(&history);
+        let full_prompt = format_chat_prompt(&history, template_engine)?;
 
         let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
         let path = model_path.to_path_buf();
@@ -195,14 +200,20 @@ async fn run_interactive(
     Ok(())
 }
 
-/// Simple ChatML-style prompt formatting.
-fn format_chat_prompt(history: &[(String, String)]) -> String {
-    let mut prompt = String::new();
-    for (role, content) in history {
-        prompt.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
-    }
-    prompt.push_str("<|im_start|>assistant\n");
-    prompt
+fn format_chat_prompt(
+    history: &[(String, String)],
+    engine: &ChatTemplateEngine,
+) -> anyhow::Result<String> {
+    use hypura::server::ollama_types::ChatMessage;
+    let messages: Vec<ChatMessage> = history
+        .iter()
+        .map(|(role, content)| ChatMessage {
+            role: role.clone(),
+            content: Some(content.clone()),
+            tool_calls: None,
+        })
+        .collect();
+    engine.render_prompt(&messages, None, true)
 }
 
 fn print_placement_header(

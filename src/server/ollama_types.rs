@@ -1,5 +1,34 @@
 use serde::{Deserialize, Serialize};
 
+// ── Tool types ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolFunction {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
 // ── Request types ──
 
 #[derive(Debug, Deserialize)]
@@ -20,15 +49,17 @@ pub struct ChatRequest {
     pub stream: bool,
     #[serde(default)]
     pub options: GenerateOptions,
-    /// Accepted but ignored for MVP.
     #[serde(default)]
-    pub tools: Option<serde_json::Value>,
+    pub tools: Option<Vec<Tool>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -55,18 +86,8 @@ pub struct GenerateResponseChunk {
     pub done: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_duration: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub load_duration: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_eval_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_eval_duration: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub eval_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub eval_duration: Option<u64>,
+    #[serde(flatten)]
+    pub timing: TimingStats,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,18 +98,8 @@ pub struct ChatResponseChunk {
     pub done: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_duration: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub load_duration: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_eval_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_eval_duration: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub eval_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub eval_duration: Option<u64>,
+    #[serde(flatten)]
+    pub timing: TimingStats,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,6 +127,48 @@ pub struct ModelDetails {
 pub struct ShowResponse {
     pub details: ModelDetails,
     pub model_info: serde_json::Value,
+}
+
+/// Timing statistics shared by generate and chat response types.
+#[derive(Debug, Default, Serialize)]
+pub struct TimingStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_duration: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval_duration: Option<u64>,
+}
+
+impl TimingStats {
+    pub fn from_result(
+        result: &Option<crate::compute::inference::GenerationResult>,
+        total_ns: u64,
+        load_duration_ns: u64,
+    ) -> Self {
+        Self {
+            total_duration: Some(total_ns),
+            load_duration: Some(load_duration_ns),
+            prompt_eval_count: result.as_ref().map(|r| r.prompt_tokens),
+            prompt_eval_duration: result
+                .as_ref()
+                .map(|r| (r.prompt_eval_ms * 1_000_000.0) as u64),
+            eval_count: result.as_ref().map(|r| r.tokens_generated),
+            eval_duration: result.as_ref().map(|r| {
+                if r.tok_per_sec_avg > 0.0 {
+                    (r.tokens_generated as f64 / r.tok_per_sec_avg * 1e9) as u64
+                } else {
+                    0
+                }
+            }),
+        }
+    }
 }
 
 fn default_true() -> bool {

@@ -44,6 +44,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
 
+# Chat template rendering
+minijinja = { version = "2", features = ["builtins", "json"] }
+
 # Misc
 tokio-stream = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

@@ -9,13 +9,14 @@ use axum::{Json, Router};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::compute::inference::{GenerateFromLoadedParams, GenerationResult, LoadedModel};
-use crate::server::chat::format_chat_prompt;
 use crate::server::ollama_types::*;
 use crate::server::streaming;
+use crate::server::template::ChatTemplateEngine;
 use crate::telemetry::metrics::TelemetryEmitter;
 
 pub struct AppState {
     pub loaded_model: Arc<std::sync::Mutex<LoadedModel>>,
+    pub template_engine: ChatTemplateEngine,
     pub model_name: String,
     pub gguf_info: GgufInfo,
     pub load_duration_ns: u64,
@@ -138,7 +139,17 @@ async fn chat_handler(
     let load_duration_ns = state.load_duration_ns;
 
     let sampling = build_sampling(&req.options);
-    let prompt = format_chat_prompt(&req.messages);
+    let prompt = match state.template_engine.render_prompt(
+        &req.messages,
+        req.tools.as_deref(),
+        true,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("Template render error: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
     let model_name = state.model_name.clone();
 
     let (token_tx, token_rx) = mpsc::unbounded_channel();
@@ -166,9 +177,11 @@ async fn chat_handler(
         }
     });
 
+    let tools = req.tools.unwrap_or_default();
+
     if req.stream {
         let body =
-            streaming::ndjson_chat_stream(model_name, token_rx, result_rx, request_start, load_duration_ns);
+            streaming::ndjson_chat_stream(model_name, token_rx, result_rx, request_start, load_duration_ns, tools);
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/x-ndjson")],
@@ -176,7 +189,7 @@ async fn chat_handler(
         )
             .into_response()
     } else {
-        let result = collect_chat(model_name, token_rx, result_rx, request_start, load_duration_ns).await;
+        let result = collect_chat(model_name, token_rx, result_rx, request_start, load_duration_ns, &tools).await;
         Json(result).into_response()
     }
 }
@@ -223,20 +236,7 @@ async fn collect_generate(
         response: full_response,
         done: true,
         done_reason: Some("stop".into()),
-        total_duration: Some(total_ns),
-        load_duration: Some(load_duration_ns),
-        prompt_eval_count: result.as_ref().map(|r| r.prompt_tokens),
-        prompt_eval_duration: result
-            .as_ref()
-            .map(|r| (r.prompt_eval_ms * 1_000_000.0) as u64),
-        eval_count: result.as_ref().map(|r| r.tokens_generated),
-        eval_duration: result.as_ref().map(|r| {
-            if r.tok_per_sec_avg > 0.0 {
-                (r.tokens_generated as f64 / r.tok_per_sec_avg * 1e9) as u64
-            } else {
-                0
-            }
-        }),
+        timing: TimingStats::from_result(&result, total_ns, load_duration_ns),
     }
 }
 
@@ -246,6 +246,7 @@ async fn collect_chat(
     result_rx: oneshot::Receiver<GenerationResult>,
     request_start: Instant,
     load_duration_ns: u64,
+    tools: &[Tool],
 ) -> ChatResponseChunk {
     let mut full_response = String::new();
     while let Some(token) = token_rx.recv().await {
@@ -254,29 +255,31 @@ async fn collect_chat(
     let total_ns = request_start.elapsed().as_nanos() as u64;
     let result = result_rx.await.ok();
 
+    // Parse tool calls if tools were provided
+    let (content, tool_calls, done_reason) = if !tools.is_empty() {
+        use crate::server::tool_parse::{parse_tool_calls, ToolParseResult};
+        match parse_tool_calls(&full_response, tools) {
+            ToolParseResult::ToolCalls { content, calls } => {
+                let c = if content.is_empty() { None } else { Some(content) };
+                (c, Some(calls), "tool_calls")
+            }
+            ToolParseResult::Text(t) => (Some(t), None, "stop"),
+        }
+    } else {
+        (Some(full_response), None, "stop")
+    };
+
     ChatResponseChunk {
         model: model_name,
         created_at: now_rfc3339(),
         message: ChatMessage {
             role: "assistant".into(),
-            content: full_response,
+            content,
+            tool_calls,
         },
         done: true,
-        done_reason: Some("stop".into()),
-        total_duration: Some(total_ns),
-        load_duration: Some(load_duration_ns),
-        prompt_eval_count: result.as_ref().map(|r| r.prompt_tokens),
-        prompt_eval_duration: result
-            .as_ref()
-            .map(|r| (r.prompt_eval_ms * 1_000_000.0) as u64),
-        eval_count: result.as_ref().map(|r| r.tokens_generated),
-        eval_duration: result.as_ref().map(|r| {
-            if r.tok_per_sec_avg > 0.0 {
-                (r.tokens_generated as f64 / r.tok_per_sec_avg * 1e9) as u64
-            } else {
-                0
-            }
-        }),
+        done_reason: Some(done_reason.into()),
+        timing: TimingStats::from_result(&result, total_ns, load_duration_ns),
     }
 }
 
